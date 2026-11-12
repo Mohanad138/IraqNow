@@ -11,21 +11,32 @@ TG_SESSION = os.getenv("TG_SESSION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 GROQ_MODEL = "openai/gpt-oss-120b"
+GRAPH = "https://graph.facebook.com/v21.0"
 STATE_FILE = "relay_state.json"
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# اجعلها True لتجربة آخر 5 منشورات، ثم أرجعها False
+TEST_MODE = False 
+
+FB_TOKEN_IRAQ = os.getenv("FB_TOKEN_IRAQ")
+PAGE_ID_IRAQ = os.getenv("PAGE_ID_IRAQ")
+
 CHANNELS = {
     -1009001073232: {
-        "name": "العراق الآن", "target": "@IQNowNews",
-        "source_username": "@RN24_IQ",
-        "add_link": True, "link": "https://t.me/IQNowNews",
-        "prompt": """أنت محرر صحفي عراقي. أعد صياغة النص بأسلوب صحفي.
+        "name": "العراق الآن", "target": None,
+        "source_username": "@IRAQ2TV", # 👈 تم تغيير المصدر هنا
+        "fb_page_id": PAGE_ID_IRAQ, 
+        "fb_token": FB_TOKEN_IRAQ,
+        "link": "https://t.me/IQNowNews",
+        "prompt": """أنت محرر صحفي عراقي. أعد صياغة النص التالي ليكون مشوقاً وجذاباً للقراءة.
+- **تحذير صارم جداً:** ممنوع منعاً باتاً إضافة أي معلومة، رقم، اسم، أو تفاصيل غير موجودة في النص الأصلي. مهمتك فقط إعادة ترتيب الكلمات الموجودة وجعلها مشوقة.
+- حافظ على الأرقام والأسماء كما هي تماماً.
+- **ممنوع ذكر اسم "واحد العراق" أو أي اسم قناة أخرى.**
 - انشر أي خبر سياسي أو اقتصادي أو عام (اجعل should_post=true).
-- إذا كان إعلاناً تجارياً صريحاً (بيع، اشتراك، عروض، طلب مراسلة معرف) اجعل should_post=false.
-- إذا كان النص طويلاً جداً، قم باختصاره بدون حذف المعلومات المهمة.
+- اجعل should_post=false فقط إذا كان إعلاناً تجارياً صريحاً.
 - لا تذكر اسم قناة المصدر أو روابطها نهائياً."""
-    },
+    }
 }
 
 client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
@@ -106,10 +117,6 @@ def _is_usable_media_msg(m):
         if photo and not _is_small_thumbnail_photo(photo): return True
     return False
 
-def _media_payload(m):
-    if isinstance(m.media, MessageMediaWebPage): return m.photo
-    return m.media
-
 def extract_hidden_link_urls(message, source_username=None):
     if not message or not getattr(message, "entities", None): return []
     handle = (source_username or "").lstrip("@").lower()
@@ -128,31 +135,23 @@ def clean_text(text, source_username=None):
     if not text: return ""
     cleaned = text.replace('📊', '')
     if source_username: cleaned = re.sub(re.escape(source_username), '', cleaned, flags=re.IGNORECASE)
+    
+    # 👈 حذف اسم "واحد العراق" برمجياً قبل إرساله للذكاء الاصطناعي
+    cleaned = re.sub(r'واحد\s*العراق', '', cleaned, flags=re.IGNORECASE)
+    
     cleaned = re.sub(r'(https?://)?t\.me/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'https?://t\.co/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'(?i)forwarded from.*', '', cleaned)
     cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
     return cleaned
 
-SHARE_PHRASE_RE = re.compile(r'شارك\s+(القناة|المنشور)\s+مع\s+[اأ]?صدقائ?ك?', re.IGNORECASE)
-def insert_link_after_share_phrase(text, link_text):
-    match = SHARE_PHRASE_RE.search(text)
-    if not match: return None
-    newline_idx = text.find('\n', match.end())
-    if newline_idx == -1: return text.rstrip() + f"\n{link_text}"
-    return text[:newline_idx] + f"\n{link_text}" + text[newline_idx:]
-
 def contains_click_here_phrase(text): return bool(re.search(r'اضغط\s*هنا.{0,15}(للمشاهدة|لمشاهدة|مشاهدة)', text)) if text else False
 
 def is_hardcoded_ad(text):
     if not text: return False
-    ad_keywords = [
-        r"راسل\s+المعرف", r"للحجز", r"للطلب", 
-        r"سعر", r"دينار", r"خصم", r"اشتراك"
-    ]
+    ad_keywords = [r"راسل\s+المعرف", r"@IQED3", r"للحجز", r"للطلب", r"للتواصل", r"سعر", r"دينار", r"خصم", r"اشتراك", r"ملخصات\s+ذهبية"]
     for kw in ad_keywords:
-        if re.search(kw, text, re.IGNORECASE):
-            return True
+        if re.search(kw, text, re.IGNORECASE): return True
     return False
 
 def call_groq(prompt, max_retries=3):
@@ -193,6 +192,35 @@ async def apply_processing(config, text):
         print(f"❌ خطأ المعالجة: {e}")
         return {"should_post": False, "text": ""}
 
+def _sync_post_to_facebook(page_id, token, text, media_data=None, is_video=False):
+    if not page_id or not token: return
+    try:
+        base_url = f"{GRAPH}/{page_id}"
+        if media_data:
+            if is_video:
+                res = requests.post(f"{base_url}/videos", data={"access_token": token, "description": text}, files={"source": ("video.mp4", media_data)}, timeout=90)
+            else:
+                res = requests.post(f"{base_url}/photos", data={"access_token": token, "message": text}, files={"source": ("image.jpg", media_data)}, timeout=45)
+        else:
+            res = requests.post(f"{base_url}/feed", data={"access_token": token, "message": text}, timeout=20)
+        
+        res_data = res.json()
+        if "error" in res_data:
+            print(f"❌ خطأ فيسبوك: {res_data['error']['message']}")
+            return
+            
+        post_id = res_data.get("post_id") or res_data.get("id")
+        print(f"✅ نُشر على فيسبوك ({page_id})")
+        
+        comment_text = "تابعنا على التلكرام 👇\nhttps://t.me/IQNowNews"
+        requests.post(f"{GRAPH}/{post_id}/comments", data={"access_token": token, "message": comment_text}, timeout=20)
+        print(f"✅ تمت إضافة تعليق التلكرام.")
+    except Exception as e:
+        print(f"❌ فشل النشر على فيسبوك: {e}")
+
+async def post_to_facebook(page_id, token, text, media_data=None, is_video=False):
+    await asyncio.to_thread(_sync_post_to_facebook, page_id, token, text, media_data, is_video)
+
 async def process_batch(source_id, messages):
     config = CHANNELS.get(source_id)
     if not config: return
@@ -202,7 +230,7 @@ async def process_batch(source_id, messages):
     
     if contains_click_here_phrase(raw_text): return
     
-    if is_hardcoded_ad(raw_text):
+    if is_hardcoded_ad(raw_text): 
         print(f"⏭️ تجاهل إعلان تجاري (فلتر برمجي) — {config['name']}")
         return
     
@@ -227,58 +255,39 @@ async def process_batch(source_id, messages):
     if final_text: record_published_text(f"{source_id}#final", final_text)
     
     media_msgs = [m for m in messages if _is_usable_media_msg(m)]
+    media_data = None
+    is_video = False
+    
+    if media_msgs:
+        first_m = media_msgs[0]
+        if isinstance(first_m.media, MessageMediaDocument) and first_m.video:
+            is_video = True
+        try: 
+            media_data = await client.download_media(first_m, file=bytes)
+        except Exception as e: 
+            print(f"⚠️ فشل تحميل الميديا: {e}")
 
-    if config.get("add_link") and config.get("link"):
-        link_text = config["link"]
-        inserted = None
-        if config.get("link_after_share_phrase") and final_text:
-            inserted = insert_link_after_share_phrase(final_text, link_text)
-        if inserted is not None: final_text = inserted
-        else: final_text = f"{final_text}\n\n{link_text}" if final_text else link_text
+    if not final_text.strip() and not media_data: return
 
-    try:
-        if media_msgs:
-            try:
-                to_send = _media_payload(media_msgs[0]) if len(media_msgs) == 1 else [_media_payload(m) for m in media_msgs]
-                await client.send_file(config["target"], to_send, caption=final_text or None, parse_mode="html")
-                print(f"✅ نُشر (وسائط) — {config['name']}")
-                return
-            except Exception as e:
-                if "protected chat" in str(e):
-                    files = []
-                    for m in media_msgs:
-                        try:
-                            path = await client.download_media(m, file=f"{DOWNLOAD_DIR}/")
-                            if path: files.append(path)
-                        except Exception: pass
-                    if files:
-                        to_send2 = files[0] if len(files) == 1 else files
-                        await client.send_file(config["target"], to_send2, caption=final_text or None, parse_mode="html")
-                        for f in files:
-                            try: os.remove(f)
-                            except OSError: pass
-                        print(f"✅ نُشر (وسائط محمية) — {config['name']}")
-                        return
-                else: raise e
-                
-        if final_text:
-            await client.send_message(config["target"], final_text, parse_mode="html", link_preview=False)
-            print(f"✅ نُشر (نص) — {config['name']}")
-    except Exception as e: print(f"❌ خطأ بالنشر — {config['name']}: {e}")
+    if config.get("fb_token") and config.get("fb_page_id"):
+        await post_to_facebook(config["fb_page_id"], config["fb_token"], final_text, media_data, is_video)
 
 async def catch_up_channel(source_id):
     config = CHANNELS.get(source_id, {})
     entity_ref = config.get("source_username") or source_id
-    key = str(source_id)
-    last_id = state.get(key, 0)
     
-    if last_id == 0:
-        latest = await client.get_messages(entity_ref, limit=1)
-        if latest: last_id = max(latest[0].id - 5, 0)
-        state[key] = last_id
+    if TEST_MODE:
+        messages = await client.get_messages(entity_ref, limit=5)
+    else:
+        last_id = state.get(str(source_id), 0)
+        if last_id == 0:
+            latest = await client.get_messages(entity_ref, limit=1)
+            if latest: last_id = latest[0].id - 5
+            state[str(source_id)] = last_id
+        messages = await client.get_messages(entity_ref, min_id=last_id, limit=200)
         
-    messages = await client.get_messages(entity_ref, min_id=last_id, limit=200)
     if not messages: return
+    
     messages = list(reversed(messages))
     processed_ids = set()
     
@@ -294,13 +303,18 @@ async def catch_up_channel(source_id):
             await process_batch(source_id, [msg])
             processed_ids.add(msg.id)
             new_last = msg.id
-        state[key] = new_last
+        state[str(source_id)] = new_last
 
 async def main():
+    print("🚀 بدء التشغيل...")
     await client.start()
-    await catch_up_channel(-1009001073232)
+    tasks = []
+    for source_id in CHANNELS:
+        tasks.append(catch_up_channel(source_id))
+    await asyncio.gather(*tasks)
     await client.disconnect()
     commit_state()
+    print("✅ انتهت التشغيلة.")
 
 if __name__ == "__main__":
     asyncio.run(main())
