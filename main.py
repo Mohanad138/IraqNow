@@ -5,30 +5,25 @@ from telethon.sessions import StringSession
 from telethon.tl.types import (MessageEntityTextUrl, MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage)
 import requests
 
+# قراءة المتغيرات من البيئة
 TG_API_ID = int(os.getenv("TG_API_ID"))
 TG_API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION = os.getenv("TG_SESSION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-GROQ_MODEL = "openai/gpt-oss-120b"
-GRAPH = "https://graph.facebook.com/v21.0"
+# موديل Groq الصحيح
+GROQ_MODEL = "llama-3.3-70b-versatile" 
 STATE_FILE = "relay_state.json"
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # اجعلها True لتجربة آخر 5 منشورات، ثم أرجعها False
 TEST_MODE = False 
 
-FB_TOKEN_IRAQ = os.getenv("FB_TOKEN_IRAQ")
-PAGE_ID_IRAQ = os.getenv("PAGE_ID_IRAQ")
-
 CHANNELS = {
     -1009001073232: {
-        "name": "العراق الآن", "target": None,
-        "source_username": "@IRAQ2TV", # 👈 تم تغيير المصدر هنا
-        "fb_page_id": PAGE_ID_IRAQ, 
-        "fb_token": FB_TOKEN_IRAQ,
-        "link": "https://t.me/IQNowNews",
+        "name": "العراق الآن", 
+        # 👇 تم إضافة رابط قناتك هنا
+        "target_channel": "@IQNowNews", 
+        "source_username": "@IRAQ2TV",
         "prompt": """أنت محرر صحفي عراقي. أعد صياغة النص التالي ليكون مشوقاً وجذاباً للقراءة.
 - **تحذير صارم جداً:** ممنوع منعاً باتاً إضافة أي معلومة، رقم، اسم، أو تفاصيل غير موجودة في النص الأصلي. مهمتك فقط إعادة ترتيب الكلمات الموجودة وجعلها مشوقة.
 - حافظ على الأرقام والأسماء كما هي تماماً.
@@ -136,7 +131,7 @@ def clean_text(text, source_username=None):
     cleaned = text.replace('📊', '')
     if source_username: cleaned = re.sub(re.escape(source_username), '', cleaned, flags=re.IGNORECASE)
     
-    # 👈 حذف اسم "واحد العراق" برمجياً قبل إرساله للذكاء الاصطناعي
+    # حذف اسم "واحد العراق" برمجياً
     cleaned = re.sub(r'واحد\s*العراق', '', cleaned, flags=re.IGNORECASE)
     
     cleaned = re.sub(r'(https?://)?t\.me/\S+', '', cleaned, flags=re.IGNORECASE)
@@ -183,43 +178,19 @@ async def apply_processing(config, text):
 أعد النتيجة بصيغة JSON فقط: {{"should_post": true/false, "text": "النص المعالج"}}"""
     try:
         res_raw = call_groq(full_prompt)
-        if res_raw.startswith("```"):
-            res_raw = res_raw.strip("`").strip()
-            if res_raw.lower().startswith("json"): res_raw = res_raw[4:].strip()
-        res = json.loads(res_raw)
+        
+        # استخراج JSON بشكل آمن
+        match = re.search(r'\{.*\}', res_raw, re.DOTALL)
+        if match:
+            res = json.loads(match.group(0))
+        else:
+            print("⚠️ لم يتم العثور على JSON صالح في رد الذكاء الاصطناعي.")
+            return {"should_post": False, "text": ""}
+            
         return {"should_post": bool(res.get("should_post", True)), "text": (res.get("text") or text).strip()}
     except Exception as e:
         print(f"❌ خطأ المعالجة: {e}")
         return {"should_post": False, "text": ""}
-
-def _sync_post_to_facebook(page_id, token, text, media_data=None, is_video=False):
-    if not page_id or not token: return
-    try:
-        base_url = f"{GRAPH}/{page_id}"
-        if media_data:
-            if is_video:
-                res = requests.post(f"{base_url}/videos", data={"access_token": token, "description": text}, files={"source": ("video.mp4", media_data)}, timeout=90)
-            else:
-                res = requests.post(f"{base_url}/photos", data={"access_token": token, "message": text}, files={"source": ("image.jpg", media_data)}, timeout=45)
-        else:
-            res = requests.post(f"{base_url}/feed", data={"access_token": token, "message": text}, timeout=20)
-        
-        res_data = res.json()
-        if "error" in res_data:
-            print(f"❌ خطأ فيسبوك: {res_data['error']['message']}")
-            return
-            
-        post_id = res_data.get("post_id") or res_data.get("id")
-        print(f"✅ نُشر على فيسبوك ({page_id})")
-        
-        comment_text = "تابعنا على التلكرام 👇\nhttps://t.me/IQNowNews"
-        requests.post(f"{GRAPH}/{post_id}/comments", data={"access_token": token, "message": comment_text}, timeout=20)
-        print(f"✅ تمت إضافة تعليق التلكرام.")
-    except Exception as e:
-        print(f"❌ فشل النشر على فيسبوك: {e}")
-
-async def post_to_facebook(page_id, token, text, media_data=None, is_video=False):
-    await asyncio.to_thread(_sync_post_to_facebook, page_id, token, text, media_data, is_video)
 
 async def process_batch(source_id, messages):
     config = CHANNELS.get(source_id)
@@ -255,22 +226,38 @@ async def process_batch(source_id, messages):
     if final_text: record_published_text(f"{source_id}#final", final_text)
     
     media_msgs = [m for m in messages if _is_usable_media_msg(m)]
-    media_data = None
+    media_bytes = None
     is_video = False
     
+    # تحميل الميديا في الذاكرة
     if media_msgs:
         first_m = media_msgs[0]
         if isinstance(first_m.media, MessageMediaDocument) and first_m.video:
             is_video = True
         try: 
-            media_data = await client.download_media(first_m, file=bytes)
+            media_bytes = await client.download_media(first_m, file=bytes)
         except Exception as e: 
             print(f"⚠️ فشل تحميل الميديا: {e}")
 
-    if not final_text.strip() and not media_data: return
+    if not final_text.strip() and not media_bytes: return
 
-    if config.get("fb_token") and config.get("fb_page_id"):
-        await post_to_facebook(config["fb_page_id"], config["fb_token"], final_text, media_data, is_video)
+    # 🚀 النشر إلى قناة تلكرام المستهدفة
+    target_channel = config.get("target_channel")
+    if target_channel:
+        try:
+            if media_bytes:
+                # التحقق من طول النص (تيليجرام يسمح بـ 1024 حرف كحد أقصى للتعليق على الميديا)
+                if len(final_text) > 1024:
+                    await client.send_file(target_channel, media_bytes, supports_streaming=is_video)
+                    await client.send_message(target_channel, final_text)
+                else:
+                    await client.send_file(target_channel, media_bytes, caption=final_text, supports_streaming=is_video)
+            else:
+                # إرسال النص فقط
+                await client.send_message(target_channel, final_text)
+            print(f"✅ نُشر بنجاح إلى تلكرام ({target_channel})")
+        except Exception as e:
+            print(f"❌ فشل النشر إلى تلكرام: {e}")
 
 async def catch_up_channel(source_id):
     config = CHANNELS.get(source_id, {})
@@ -284,11 +271,14 @@ async def catch_up_channel(source_id):
             latest = await client.get_messages(entity_ref, limit=1)
             if latest: last_id = latest[0].id - 5
             state[str(source_id)] = last_id
-        messages = await client.get_messages(entity_ref, min_id=last_id, limit=200)
         
+        # استخدام iter_messages لضمان عدم ضياع أي رسالة مهما كان عددها
+        messages = []
+        async for msg in client.iter_messages(entity_ref, min_id=last_id, reverse=True):
+            messages.append(msg)
+            
     if not messages: return
     
-    messages = list(reversed(messages))
     processed_ids = set()
     
     for msg in messages:
@@ -303,7 +293,10 @@ async def catch_up_channel(source_id):
             await process_batch(source_id, [msg])
             processed_ids.add(msg.id)
             new_last = msg.id
+        
+        # حفظ الحالة محلياً لضمان عدم التكرار
         state[str(source_id)] = new_last
+        save_state(state)
 
 async def main():
     print("🚀 بدء التشغيل...")
