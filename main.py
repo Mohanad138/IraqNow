@@ -11,8 +11,8 @@ TG_API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION = os.getenv("TG_SESSION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# موديل Groq الصحيح
-GROQ_MODEL = "llama-3.3-70b-versatile" 
+# ✅ تم تحديث الموديل إلى البديل الرسمي الموصى به من Groq
+GROQ_MODEL = "openai/gpt-oss-120b" 
 STATE_FILE = "relay_state.json"
 
 # اجعلها True لتجربة آخر 5 منشورات، ثم أرجعها False
@@ -21,7 +21,6 @@ TEST_MODE = False
 CHANNELS = {
     -1009001073232: {
         "name": "العراق الآن", 
-        # 👇 تم إضافة رابط قناتك هنا
         "target_channel": "@IQNowNews", 
         "source_username": "@IRAQ2TV",
         "prompt": """أنت محرر صحفي عراقي. أعد صياغة النص التالي ليكون مشوقاً وجذاباً للقراءة.
@@ -131,9 +130,7 @@ def clean_text(text, source_username=None):
     cleaned = text.replace('📊', '')
     if source_username: cleaned = re.sub(re.escape(source_username), '', cleaned, flags=re.IGNORECASE)
     
-    # حذف اسم "واحد العراق" برمجياً
     cleaned = re.sub(r'واحد\s*العراق', '', cleaned, flags=re.IGNORECASE)
-    
     cleaned = re.sub(r'(https?://)?t\.me/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'https?://t\.co/\S+', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'(?i)forwarded from.*', '', cleaned)
@@ -179,7 +176,6 @@ async def apply_processing(config, text):
     try:
         res_raw = call_groq(full_prompt)
         
-        # استخراج JSON بشكل آمن
         match = re.search(r'\{.*\}', res_raw, re.DOTALL)
         if match:
             res = json.loads(match.group(0))
@@ -229,7 +225,6 @@ async def process_batch(source_id, messages):
     media_bytes = None
     is_video = False
     
-    # تحميل الميديا في الذاكرة
     if media_msgs:
         first_m = media_msgs[0]
         if isinstance(first_m.media, MessageMediaDocument) and first_m.video:
@@ -241,19 +236,16 @@ async def process_batch(source_id, messages):
 
     if not final_text.strip() and not media_bytes: return
 
-    # 🚀 النشر إلى قناة تلكرام المستهدفة
     target_channel = config.get("target_channel")
     if target_channel:
         try:
             if media_bytes:
-                # التحقق من طول النص (تيليجرام يسمح بـ 1024 حرف كحد أقصى للتعليق على الميديا)
                 if len(final_text) > 1024:
                     await client.send_file(target_channel, media_bytes, supports_streaming=is_video)
                     await client.send_message(target_channel, final_text)
                 else:
                     await client.send_file(target_channel, media_bytes, caption=final_text, supports_streaming=is_video)
             else:
-                # إرسال النص فقط
                 await client.send_message(target_channel, final_text)
             print(f"✅ نُشر بنجاح إلى تلكرام ({target_channel})")
         except Exception as e:
@@ -272,7 +264,6 @@ async def catch_up_channel(source_id):
             if latest: last_id = latest[0].id - 5
             state[str(source_id)] = last_id
         
-        # استخدام iter_messages لضمان عدم ضياع أي رسالة مهما كان عددها
         messages = []
         async for msg in client.iter_messages(entity_ref, min_id=last_id, reverse=True):
             messages.append(msg)
@@ -294,7 +285,6 @@ async def catch_up_channel(source_id):
             processed_ids.add(msg.id)
             new_last = msg.id
         
-        # حفظ الحالة محلياً لضمان عدم التكرار
         state[str(source_id)] = new_last
         save_state(state)
 
