@@ -22,7 +22,6 @@ STATE_FILE = "relay_state.json"
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# اجعلها True لتجربة آخر 5 منشورات، ثم أرجعها False
 TEST_MODE = False 
 
 CHANNELS = {
@@ -156,7 +155,6 @@ def is_hardcoded_ad(text):
         if re.search(kw, text, re.IGNORECASE): return True
     return False
 
-# ⚡ جعل طلب Groq يعمل في الخلفية (Thread) لعدم إيقاف باقي العمليات
 async def call_groq(prompt, max_retries=3):
     if not GROQ_API_KEY: raise RuntimeError("no groq key")
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -204,8 +202,13 @@ async def apply_processing(config, text):
         return {"should_post": False, "text": ""}
 
 def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
-    if not page_id or not token: return
+    # 🛑 التحقق من وجود البيانات وطباعة الخطأ إذا كانت مفقودة
+    if not page_id or not token:
+        print("⚠️ تخطي فيسبوك: الـ PAGE_ID أو الـ FB_TOKEN غير موجود في إعدادات GitHub Secrets!")
+        return
+        
     try:
+        print(f"⏳ جاري محاولة النشر على فيسبوك (الصفحة: {page_id})...")
         base_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}"
         post_id = None
         
@@ -220,12 +223,14 @@ def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False
             res = requests.post(f"{base_url}/feed", data={"access_token": token, "message": text}, timeout=20)
         
         res_data = res.json()
+        
+        # 🛑 طباعة خطأ فيسبوك إذا رفض النشر (توكن منتهي، صلاحيات خاطئة، إلخ)
         if "error" in res_data:
-            print(f"❌ خطأ فيسبوك: {res_data['error']['message']}")
+            print(f"❌ خطأ فيسبوك: {res_data['error']['message']} (الكود: {res_data['error'].get('code')})")
             return
             
         post_id = res_data.get("post_id") or res_data.get("id")
-        print(f"✅ نُشر على فيسبوك (الصفحة: {page_id})")
+        print(f"✅ نُشر على فيسبوك بنجاح! (ID: {post_id})")
         
         if post_id and tg_link:
             comment_text = f"تابعنا على التلكرام 👇\n{tg_link}"
@@ -236,7 +241,7 @@ def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False
                 print(f"⚠️ فشل إضافة التعليق: {comment_res.json()['error']['message']}")
                 
     except Exception as e:
-        print(f"❌ فشل النشر على فيسبوك: {e}")
+        print(f"❌ فشل النشر على فيسبوك (استثناء): {e}")
 
 async def post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
     await asyncio.to_thread(_sync_post_to_facebook, page_id, token, text, media_path, is_video, tg_link)
@@ -294,7 +299,6 @@ async def process_batch(source_id, messages):
     fb_token = config.get("fb_token")
     tg_link = config.get("tg_link")
 
-    # ⚡ دالة داخلية للنشر على تلكرام
     async def _post_tg():
         if target_channel:
             try:
@@ -310,16 +314,14 @@ async def process_batch(source_id, messages):
             except Exception as e:
                 print(f"❌ فشل النشر إلى تلكرام: {e}")
 
-    # ⚡ دالة داخلية للنشر على فيسبوك
     async def _post_fb():
         if fb_page_id and fb_token:
             await post_to_facebook(fb_page_id, fb_token, final_text, media_path, is_video, tg_link)
 
-    # 🚀 تشغيل النشر على تلكرام وفيسبوك في نفس الوقت (بالتوازي)
+    # تشغيل النشر بالتوازي
     if target_channel or (fb_page_id and fb_token):
         await asyncio.gather(_post_tg(), _post_fb())
 
-    # حذف الملف المؤقت بعد الانتهاء من كلا المنصتين
     if media_path and os.path.exists(media_path):
         os.remove(media_path)
 
@@ -342,7 +344,6 @@ async def catch_up_channel(source_id):
             
     if not messages: return
     
-    # تجميع الرسائل (للتأكد من الألبومات)
     groups = []
     processed_ids = set()
     
@@ -357,17 +358,14 @@ async def catch_up_channel(source_id):
             groups.append([msg])
             processed_ids.add(msg.id)
 
-    # ⚡ تحديد عدد العمليات المتوازية (5 منشورات في وقت واحد لتجنب الحظر)
     sem = asyncio.Semaphore(5)
     
     async def process_group_with_sem(group):
         async with sem:
             await process_batch(source_id, group)
     
-    # 🚀 بدء معالجة جميع المنشورات بالتوازي
     await asyncio.gather(*(process_group_with_sem(g) for g in groups))
     
-    # تحديث الحالة بناءً على أعلى ID تمت معالجته
     if groups:
         max_processed_id = max(g[-1].id for g in groups)
         state[str(source_id)] = max(state.get(str(source_id), 0), max_processed_id)
@@ -375,6 +373,13 @@ async def catch_up_channel(source_id):
 
 async def main():
     print("🚀 بدء التشغيل...")
+    
+    # 🔍 فحص المتغيرات وطباعتها للتأكد من وصولها
+    if not FB_TOKEN_IRAQ or not PAGE_ID_IRAQ:
+        print("⚠️ تحذير هام: لم يتم العثور على FB_TOKEN_IRAQ أو PAGE_ID_IRAQ في إعدادات GitHub Secrets!")
+    else:
+        print(f"🔑 تم العثور على بيانات فيسبوك (الصفحة: {PAGE_ID_IRAQ})")
+
     await client.start()
     tasks = []
     for source_id in CHANNELS:
