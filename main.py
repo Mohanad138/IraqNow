@@ -156,21 +156,26 @@ def is_hardcoded_ad(text):
         if re.search(kw, text, re.IGNORECASE): return True
     return False
 
-def call_groq(prompt, max_retries=3):
+# ⚡ جعل طلب Groq يعمل في الخلفية (Thread) لعدم إيقاف باقي العمليات
+async def call_groq(prompt, max_retries=3):
     if not GROQ_API_KEY: raise RuntimeError("no groq key")
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     body = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.3}
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = requests.post(url, json=body, headers=headers, timeout=30)
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                time.sleep(2 ** attempt); continue
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            if attempt == max_retries: raise e
-            time.sleep(2 ** attempt)
+    
+    def _sync_request():
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.post(url, json=body, headers=headers, timeout=30)
+                if resp.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    time.sleep(2 ** attempt); continue
+                resp.raise_for_status()
+                return resp.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                if attempt == max_retries: raise e
+                time.sleep(2 ** attempt)
+                
+    return await asyncio.to_thread(_sync_request)
 
 async def apply_processing(config, text):
     if not text: return {"should_post": True, "text": ""}
@@ -184,7 +189,7 @@ async def apply_processing(config, text):
 
 أعد النتيجة بصيغة JSON فقط: {{"should_post": true/false, "text": "النص المعالج"}}"""
     try:
-        res_raw = call_groq(full_prompt)
+        res_raw = await call_groq(full_prompt)
         
         match = re.search(r'\{.*\}', res_raw, re.DOTALL)
         if match:
@@ -198,7 +203,6 @@ async def apply_processing(config, text):
         print(f"❌ خطأ المعالجة: {e}")
         return {"should_post": False, "text": ""}
 
-# دالة النشر على فيسبوك (تتضمن إضافة تعليق)
 def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
     if not page_id or not token: return
     try:
@@ -223,7 +227,6 @@ def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False
         post_id = res_data.get("post_id") or res_data.get("id")
         print(f"✅ نُشر على فيسبوك (الصفحة: {page_id})")
         
-        # إضافة التعليق الأول الذي يحتوي على رابط التلكرام
         if post_id and tg_link:
             comment_text = f"تابعنا على التلكرام 👇\n{tg_link}"
             comment_res = requests.post(f"https://graph.facebook.com/{GRAPH_API_VERSION}/{post_id}/comments", data={"access_token": token, "message": comment_text}, timeout=20)
@@ -286,34 +289,37 @@ async def process_batch(source_id, messages):
 
     if not final_text.strip() and not media_path: return
 
-    # 1. النشر إلى تلكرام
     target_channel = config.get("target_channel")
-    if target_channel:
-        try:
-            if media_path:
-                if len(final_text) > 1024:
-                    await client.send_file(target_channel, media_path, supports_streaming=is_video, force_document=False)
-                    await client.send_message(target_channel, final_text)
+    fb_page_id = config.get("fb_page_id")
+    fb_token = config.get("fb_token")
+    tg_link = config.get("tg_link")
+
+    # ⚡ دالة داخلية للنشر على تلكرام
+    async def _post_tg():
+        if target_channel:
+            try:
+                if media_path:
+                    if len(final_text) > 1024:
+                        await client.send_file(target_channel, media_path, supports_streaming=is_video, force_document=False)
+                        await client.send_message(target_channel, final_text)
+                    else:
+                        await client.send_file(target_channel, media_path, caption=final_text, supports_streaming=is_video, force_document=False)
                 else:
-                    await client.send_file(target_channel, media_path, caption=final_text, supports_streaming=is_video, force_document=False)
-            else:
-                await client.send_message(target_channel, final_text)
-            print(f"✅ نُشر بنجاح إلى تلكرام ({target_channel})")
-        except Exception as e:
-            print(f"❌ فشل النشر إلى تلكرام: {e}")
+                    await client.send_message(target_channel, final_text)
+                print(f"✅ نُشر بنجاح إلى تلكرام ({target_channel})")
+            except Exception as e:
+                print(f"❌ فشل النشر إلى تلكرام: {e}")
 
-    # 2. النشر إلى فيسبوك
-    if config.get("fb_page_id") and config.get("fb_token"):
-        await post_to_facebook(
-            page_id=config["fb_page_id"], 
-            token=config["fb_token"], 
-            text=final_text, 
-            media_path=media_path, 
-            is_video=is_video,
-            tg_link=config.get("tg_link")
-        )
+    # ⚡ دالة داخلية للنشر على فيسبوك
+    async def _post_fb():
+        if fb_page_id and fb_token:
+            await post_to_facebook(fb_page_id, fb_token, final_text, media_path, is_video, tg_link)
 
-    # 3. حذف الملف المؤقت بعد الانتهاء من كلا المنصتين
+    # 🚀 تشغيل النشر على تلكرام وفيسبوك في نفس الوقت (بالتوازي)
+    if target_channel or (fb_page_id and fb_token):
+        await asyncio.gather(_post_tg(), _post_fb())
+
+    # حذف الملف المؤقت بعد الانتهاء من كلا المنصتين
     if media_path and os.path.exists(media_path):
         os.remove(media_path)
 
@@ -336,6 +342,8 @@ async def catch_up_channel(source_id):
             
     if not messages: return
     
+    # تجميع الرسائل (للتأكد من الألبومات)
+    groups = []
     processed_ids = set()
     
     for msg in messages:
@@ -343,19 +351,27 @@ async def catch_up_channel(source_id):
         if msg.grouped_id:
             group = [m for m in messages if m.grouped_id == msg.grouped_id and m.id not in processed_ids]
             group.sort(key=lambda m: m.id)
-            await process_batch(source_id, group)
+            groups.append(group)
             processed_ids.update(m.id for m in group)
-            new_last = group[-1].id
         else:
-            await process_batch(source_id, [msg])
+            groups.append([msg])
             processed_ids.add(msg.id)
-            new_last = msg.id
-        
-        state[str(source_id)] = new_last
+
+    # ⚡ تحديد عدد العمليات المتوازية (5 منشورات في وقت واحد لتجنب الحظر)
+    sem = asyncio.Semaphore(5)
+    
+    async def process_group_with_sem(group):
+        async with sem:
+            await process_batch(source_id, group)
+    
+    # 🚀 بدء معالجة جميع المنشورات بالتوازي
+    await asyncio.gather(*(process_group_with_sem(g) for g in groups))
+    
+    # تحديث الحالة بناءً على أعلى ID تمت معالجته
+    if groups:
+        max_processed_id = max(g[-1].id for g in groups)
+        state[str(source_id)] = max(state.get(str(source_id), 0), max_processed_id)
         save_state(state)
-        
-        # ⏱️ تأخير بسيط (3 ثواني) لتجنب الحظر من فيسبوك وتلكرام
-        await asyncio.sleep(3)
 
 async def main():
     print("🚀 بدء التشغيل...")
