@@ -1,12 +1,17 @@
 name: Telegram to Facebook Relay
 
 on:
+  # جدولة داخلية من جيت هاب (احتياطية)
   schedule:
-    # يعمل كل 15 دقيقة (يمكنك تغييرها حسب رغبتك)
     - cron: '*/15 * * * *'
-  workflow_dispatch: # يسمح لك بتشغيله يدوياً من زر Run workflow
+    
+  # للسماح بالتشغيل اليدوي من زر Run workflow
+  workflow_dispatch:
+  
+  # 👇 هذا هو السطر الأهم الذي يربط cron-job.org بالسكريبت
+  repository_dispatch:
+    types: [run-iraq]
 
-# صلاحية الكتابة ضرورية لحفظ ملف الحالة (relay_state.json) ورفعه للمستودع
 permissions:
   contents: write
 
@@ -35,15 +40,10 @@ jobs:
 
       - name: Run Script
         env:
-          # متغيرات تلكرام
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
           TG_SESSION: ${{ secrets.TG_SESSION }}
-          
-          # متغيرات الذكاء الاصطناعي
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          
-          # متغيرات فيسبوك (هذه هي التي كانت ناقصة)
           FB_TOKEN_IRAQ: ${{ secrets.FB_TOKEN_IRAQ }}
           PAGE_ID_IRAQ: ${{ secrets.PAGE_ID_IRAQ }}
         run: python main.py
