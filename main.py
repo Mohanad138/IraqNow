@@ -55,8 +55,8 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f: json.dump(state, f, ensure_ascii=False, indent=2)
 
 state = load_state()
-DUP_HISTORY_SIZE = 30
-DUP_SIMILARITY_THRESHOLD = 0.80   
+DUP_HISTORY_SIZE = 50 # زيادة العدد قليلاً لتجنب التكرار العشوائي
+DUP_SIMILARITY_THRESHOLD = 0.85   
 
 def _norm_for_dup(text):
     t = text.lower()
@@ -123,7 +123,8 @@ def _is_usable_media_msg(m):
 def extract_hidden_link_urls(message, source_username=None):
     if not message or not getattr(message, "entities", None): return []
     handle = (source_username or "").lstrip("@").lower()
-    skip_anchor_re = re.compile(r'read\s*more|اقرأ\s*المزيد', re.IGNORECASE)
+    # تجاهل الروابط التي تأتي خلف كلمات ترويجية
+    skip_anchor_re = re.compile(r'read\s*more|اقرأ\s*المزيد|عاجل|شاهد|اشترك|تفاصيل|المزيد', re.IGNORECASE)
     urls = []
     try:
         for entity, anchor_text in message.get_entities_text(MessageEntityTextUrl):
@@ -202,11 +203,7 @@ async def apply_processing(config, text):
         return {"should_post": False, "text": ""}
 
 def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
-    # 🛑 التحقق من وجود البيانات وطباعة الخطأ إذا كانت مفقودة
-    if not page_id or not token:
-        print("⚠️ تخطي فيسبوك: الـ PAGE_ID أو الـ FB_TOKEN غير موجود في إعدادات GitHub Secrets!")
-        return
-        
+    if not page_id or not token: return
     try:
         print(f"⏳ جاري محاولة النشر على فيسبوك (الصفحة: {page_id})...")
         base_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}"
@@ -224,24 +221,18 @@ def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False
         
         res_data = res.json()
         
-        # 🛑 طباعة خطأ فيسبوك إذا رفض النشر (توكن منتهي، صلاحيات خاطئة، إلخ)
         if "error" in res_data:
-            print(f"❌ خطأ فيسبوك: {res_data['error']['message']} (الكود: {res_data['error'].get('code')})")
+            print(f"❌ خطأ فيسبوك: {res_data['error']['message']}")
             return
             
         post_id = res_data.get("post_id") or res_data.get("id")
-        print(f"✅ نُشر على فيسبوك بنجاح! (ID: {post_id})")
+        print(f"✅ نُشر على فيسبوك بنجاح!")
         
         if post_id and tg_link:
             comment_text = f"تابعنا على التلكرام 👇\n{tg_link}"
-            comment_res = requests.post(f"https://graph.facebook.com/{GRAPH_API_VERSION}/{post_id}/comments", data={"access_token": token, "message": comment_text}, timeout=20)
-            if "error" not in comment_res.json():
-                print(f"✅ تمت إضافة تعليق التلكرام على فيسبوك.")
-            else:
-                print(f"⚠️ فشل إضافة التعليق: {comment_res.json()['error']['message']}")
-                
+            requests.post(f"https://graph.facebook.com/{GRAPH_API_VERSION}/{post_id}/comments", data={"access_token": token, "message": comment_text}, timeout=20)
     except Exception as e:
-        print(f"❌ فشل النشر على فيسبوك (استثناء): {e}")
+        print(f"❌ فشل النشر على فيسبوك: {e}")
 
 async def post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
     await asyncio.to_thread(_sync_post_to_facebook, page_id, token, text, media_path, is_video, tg_link)
@@ -254,18 +245,20 @@ async def process_batch(source_id, messages):
     text_msg = next((m for m in messages if m.message), None)
     
     if contains_click_here_phrase(raw_text): return
-    
     if is_hardcoded_ad(raw_text): 
         print(f"⏭️ تجاهل إعلان تجاري (فلتر برمجي) — {config['name']}")
         return
     
+    # استخراج الروابط المخفية التي تم تجاهل الترويج منها
     hidden_links = extract_hidden_link_urls(text_msg, config.get("source_username"))
     if hidden_links: 
         raw_text = (raw_text.rstrip() + "\n\n" + "\n".join(hidden_links)) if raw_text else "\n".join(hidden_links)
     
     cleaned = clean_text(raw_text, config.get("source_username"))
     
-    if is_duplicate_content(source_id, cleaned): return
+    if is_duplicate_content(source_id, cleaned): 
+        print(f"⏭️ تجاهل تكرار — {config['name']}")
+        return
     
     res = await apply_processing(config, cleaned)
     should_post = res.get("should_post", True)
@@ -318,7 +311,6 @@ async def process_batch(source_id, messages):
         if fb_page_id and fb_token:
             await post_to_facebook(fb_page_id, fb_token, final_text, media_path, is_video, tg_link)
 
-    # تشغيل النشر بالتوازي
     if target_channel or (fb_page_id and fb_token):
         await asyncio.gather(_post_tg(), _post_fb())
 
@@ -374,11 +366,10 @@ async def catch_up_channel(source_id):
 async def main():
     print("🚀 بدء التشغيل...")
     
-    # 🔍 فحص المتغيرات وطباعتها للتأكد من وصولها
     if not FB_TOKEN_IRAQ or not PAGE_ID_IRAQ:
-        print("⚠️ تحذير هام: لم يتم العثور على FB_TOKEN_IRAQ أو PAGE_ID_IRAQ في إعدادات GitHub Secrets!")
+        print("⚠️ تحذير: بيانات فيسبوك مفقودة!")
     else:
-        print(f"🔑 تم العثور على بيانات فيسبوك (الصفحة: {PAGE_ID_IRAQ})")
+        print(f"🔑 تم العثور على بيانات فيسبوك.")
 
     await client.start()
     tasks = []
