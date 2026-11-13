@@ -5,14 +5,19 @@ from telethon.sessions import StringSession
 from telethon.tl.types import (MessageEntityTextUrl, MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage)
 import requests
 
-# قراءة المتغيرات من البيئة
+# قراءة المتغيرات من البيئة (Secrets)
 TG_API_ID = int(os.getenv("TG_API_ID"))
 TG_API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION = os.getenv("TG_SESSION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# متغيرات فيسبوك
+FB_TOKEN_IRAQ = os.getenv("FB_TOKEN_IRAQ")
+PAGE_ID_IRAQ = os.getenv("PAGE_ID_IRAQ")
+
 # موديل Groq الصحيح
 GROQ_MODEL = "openai/gpt-oss-120b" 
+GRAPH_API_VERSION = "v21.0"
 STATE_FILE = "relay_state.json"
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -25,6 +30,9 @@ CHANNELS = {
         "name": "العراق الآن", 
         "target_channel": "@IQNowNews", 
         "source_username": "@IRAQ2TV",
+        "fb_page_id": PAGE_ID_IRAQ,
+        "fb_token": FB_TOKEN_IRAQ,
+        "tg_link": "https://t.me/IQNowNews",
         "prompt": """أنت محرر صحفي عراقي. أعد صياغة النص التالي ليكون مشوقاً وجذاباً للقراءة.
 - **تحذير صارم جداً:** ممنوع منعاً باتاً إضافة أي معلومة، رقم، اسم، أو تفاصيل غير موجودة في النص الأصلي. مهمتك فقط إعادة ترتيب الكلمات الموجودة وجعلها مشوقة.
 - حافظ على الأرقام والأسماء كما هي تماماً.
@@ -190,6 +198,46 @@ async def apply_processing(config, text):
         print(f"❌ خطأ المعالجة: {e}")
         return {"should_post": False, "text": ""}
 
+# دالة النشر على فيسبوك (تتضمن إضافة تعليق)
+def _sync_post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
+    if not page_id or not token: return
+    try:
+        base_url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}"
+        post_id = None
+        
+        if media_path:
+            if is_video:
+                with open(media_path, 'rb') as f:
+                    res = requests.post(f"{base_url}/videos", data={"access_token": token, "description": text}, files={"source": f}, timeout=300)
+            else:
+                with open(media_path, 'rb') as f:
+                    res = requests.post(f"{base_url}/photos", data={"access_token": token, "message": text}, files={"source": f}, timeout=60)
+        else:
+            res = requests.post(f"{base_url}/feed", data={"access_token": token, "message": text}, timeout=20)
+        
+        res_data = res.json()
+        if "error" in res_data:
+            print(f"❌ خطأ فيسبوك: {res_data['error']['message']}")
+            return
+            
+        post_id = res_data.get("post_id") or res_data.get("id")
+        print(f"✅ نُشر على فيسبوك (الصفحة: {page_id})")
+        
+        # إضافة التعليق الأول الذي يحتوي على رابط التلكرام
+        if post_id and tg_link:
+            comment_text = f"تابعنا على التلكرام 👇\n{tg_link}"
+            comment_res = requests.post(f"https://graph.facebook.com/{GRAPH_API_VERSION}/{post_id}/comments", data={"access_token": token, "message": comment_text}, timeout=20)
+            if "error" not in comment_res.json():
+                print(f"✅ تمت إضافة تعليق التلكرام على فيسبوك.")
+            else:
+                print(f"⚠️ فشل إضافة التعليق: {comment_res.json()['error']['message']}")
+                
+    except Exception as e:
+        print(f"❌ فشل النشر على فيسبوك: {e}")
+
+async def post_to_facebook(page_id, token, text, media_path=None, is_video=False, tg_link=""):
+    await asyncio.to_thread(_sync_post_to_facebook, page_id, token, text, media_path, is_video, tg_link)
+
 async def process_batch(source_id, messages):
     config = CHANNELS.get(source_id)
     if not config: return
@@ -227,7 +275,6 @@ async def process_batch(source_id, messages):
     media_path = None
     is_video = False
     
-    # حفظ الميديا في مجلد مؤقت بدلاً من الذاكرة لضمان التعرف على صيغتها
     if media_msgs:
         first_m = media_msgs[0]
         if isinstance(first_m.media, MessageMediaDocument) and first_m.video:
@@ -239,11 +286,11 @@ async def process_batch(source_id, messages):
 
     if not final_text.strip() and not media_path: return
 
+    # 1. النشر إلى تلكرام
     target_channel = config.get("target_channel")
     if target_channel:
         try:
             if media_path:
-                # force_document=False يضمن إرسالها كصورة/فيديو وليس ملف
                 if len(final_text) > 1024:
                     await client.send_file(target_channel, media_path, supports_streaming=is_video, force_document=False)
                     await client.send_message(target_channel, final_text)
@@ -252,16 +299,23 @@ async def process_batch(source_id, messages):
             else:
                 await client.send_message(target_channel, final_text)
             print(f"✅ نُشر بنجاح إلى تلكرام ({target_channel})")
-            
-            # حذف الملف المؤقت بعد النشر لتوفير مساحة السيرفر
-            if media_path and os.path.exists(media_path):
-                os.remove(media_path)
-                
         except Exception as e:
             print(f"❌ فشل النشر إلى تلكرام: {e}")
-            # حذف الملف حتى لو فشل النشر
-            if media_path and os.path.exists(media_path):
-                os.remove(media_path)
+
+    # 2. النشر إلى فيسبوك
+    if config.get("fb_page_id") and config.get("fb_token"):
+        await post_to_facebook(
+            page_id=config["fb_page_id"], 
+            token=config["fb_token"], 
+            text=final_text, 
+            media_path=media_path, 
+            is_video=is_video,
+            tg_link=config.get("tg_link")
+        )
+
+    # 3. حذف الملف المؤقت بعد الانتهاء من كلا المنصتين
+    if media_path and os.path.exists(media_path):
+        os.remove(media_path)
 
 async def catch_up_channel(source_id):
     config = CHANNELS.get(source_id, {})
@@ -300,8 +354,8 @@ async def catch_up_channel(source_id):
         state[str(source_id)] = new_last
         save_state(state)
         
-        # ⏱️ تأخير بسيط (ثانيتين) بين كل منشور لتجنب الحظر وتسريع النشر الآمن
-        await asyncio.sleep(2)
+        # ⏱️ تأخير بسيط (3 ثواني) لتجنب الحظر من فيسبوك وتلكرام
+        await asyncio.sleep(3)
 
 async def main():
     print("🚀 بدء التشغيل...")
