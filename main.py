@@ -11,9 +11,11 @@ TG_API_HASH = os.getenv("TG_API_HASH")
 TG_SESSION = os.getenv("TG_SESSION")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ✅ تم تحديث الموديل إلى البديل الرسمي الموصى به من Groq
+# موديل Groq الصحيح
 GROQ_MODEL = "openai/gpt-oss-120b" 
 STATE_FILE = "relay_state.json"
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # اجعلها True لتجربة آخر 5 منشورات، ثم أرجعها False
 TEST_MODE = False 
@@ -222,34 +224,44 @@ async def process_batch(source_id, messages):
     if final_text: record_published_text(f"{source_id}#final", final_text)
     
     media_msgs = [m for m in messages if _is_usable_media_msg(m)]
-    media_bytes = None
+    media_path = None
     is_video = False
     
+    # حفظ الميديا في مجلد مؤقت بدلاً من الذاكرة لضمان التعرف على صيغتها
     if media_msgs:
         first_m = media_msgs[0]
         if isinstance(first_m.media, MessageMediaDocument) and first_m.video:
             is_video = True
         try: 
-            media_bytes = await client.download_media(first_m, file=bytes)
+            media_path = await client.download_media(first_m, file=DOWNLOAD_DIR)
         except Exception as e: 
             print(f"⚠️ فشل تحميل الميديا: {e}")
 
-    if not final_text.strip() and not media_bytes: return
+    if not final_text.strip() and not media_path: return
 
     target_channel = config.get("target_channel")
     if target_channel:
         try:
-            if media_bytes:
+            if media_path:
+                # force_document=False يضمن إرسالها كصورة/فيديو وليس ملف
                 if len(final_text) > 1024:
-                    await client.send_file(target_channel, media_bytes, supports_streaming=is_video)
+                    await client.send_file(target_channel, media_path, supports_streaming=is_video, force_document=False)
                     await client.send_message(target_channel, final_text)
                 else:
-                    await client.send_file(target_channel, media_bytes, caption=final_text, supports_streaming=is_video)
+                    await client.send_file(target_channel, media_path, caption=final_text, supports_streaming=is_video, force_document=False)
             else:
                 await client.send_message(target_channel, final_text)
             print(f"✅ نُشر بنجاح إلى تلكرام ({target_channel})")
+            
+            # حذف الملف المؤقت بعد النشر لتوفير مساحة السيرفر
+            if media_path and os.path.exists(media_path):
+                os.remove(media_path)
+                
         except Exception as e:
             print(f"❌ فشل النشر إلى تلكرام: {e}")
+            # حذف الملف حتى لو فشل النشر
+            if media_path and os.path.exists(media_path):
+                os.remove(media_path)
 
 async def catch_up_channel(source_id):
     config = CHANNELS.get(source_id, {})
@@ -287,6 +299,9 @@ async def catch_up_channel(source_id):
         
         state[str(source_id)] = new_last
         save_state(state)
+        
+        # ⏱️ تأخير بسيط (ثانيتين) بين كل منشور لتجنب الحظر وتسريع النشر الآمن
+        await asyncio.sleep(2)
 
 async def main():
     print("🚀 بدء التشغيل...")
